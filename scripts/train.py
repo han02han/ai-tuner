@@ -18,6 +18,7 @@ Usage:
 import argparse
 import json
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -150,6 +151,9 @@ class PairedVocalDataset(Dataset):
 # Mel & pitch extraction
 # ---------------------------------------------------------------------------
 
+# Cached mel filter banks: keyed by (sr, n_fft, n_mels, device)
+_mel_basis_cache: dict = {}
+
 def extract_mel(y: torch.Tensor, sr: int, n_fft: int, hop: int, win: int,
                 n_mels: int) -> torch.Tensor:
     """Extract log-mel spectrogram from waveform."""
@@ -157,11 +161,13 @@ def extract_mel(y: torch.Tensor, sr: int, n_fft: int, hop: int, win: int,
     spec = torch.stft(y, n_fft, hop, win, window, return_complex=True).abs()
     spec = spec ** 2  # power spectrum
 
-    # Mel filter
-    from librosa.filters import mel as mel_fn
-    mel_basis = torch.from_numpy(
-        mel_fn(sr=sr, n_fft=n_fft, n_mels=n_mels)
-    ).float().to(y.device)
+    cache_key = (sr, n_fft, n_mels, y.device)
+    if cache_key not in _mel_basis_cache:
+        from librosa.filters import mel as mel_fn
+        _mel_basis_cache[cache_key] = torch.from_numpy(
+            mel_fn(sr=sr, n_fft=n_fft, n_mels=n_mels)
+        ).float().to(y.device)
+    mel_basis = _mel_basis_cache[cache_key]
 
     mel = torch.matmul(mel_basis, spec)
     mel = torch.log(torch.clamp(mel, min=1e-5))
@@ -185,6 +191,7 @@ def extract_pitch(y: np.ndarray, sr: int, hop_length: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def train(args):
+    torch.set_float32_matmul_precision("medium")
     config = TrainConfig()
     # Override from args
     config.batch_size = args.batch_size
@@ -207,6 +214,8 @@ def train(args):
         num_workers=args.num_workers,
         drop_last=True,
         pin_memory=(config.device == "cuda"),
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
     print(f"Dataset: {len(dataset)} pairs, {len(dataloader)} batches/epoch")
 
@@ -234,6 +243,10 @@ def train(args):
         discriminator.load_state_dict(ckpt["discriminator"])
         start_epoch = ckpt["epoch"] + 1
         print(f"Resumed from epoch {start_epoch}")
+
+    print("Compiling models (first step will be slow)...")
+    generator = torch.compile(generator, mode="max-autotune")
+    discriminator = torch.compile(discriminator, mode="max-autotune")
 
     # Optimizers
     opt_g = torch.optim.AdamW(
@@ -272,6 +285,10 @@ def train(args):
         epoch_loss_d = 0.0
 
         for batch in pbar:
+            _profile = (global_step < 3 or global_step % config.log_interval == 0)
+            if _profile:
+                _t0 = time.perf_counter()
+
             y_shifted, y_clean, target_f0 = batch
             y_shifted = y_shifted.to(device)
             y_clean = y_clean.to(device)
@@ -280,6 +297,11 @@ def train(args):
             min_len = min(y_shifted.shape[-1], y_clean.shape[-1])
             y_shifted = y_shifted[..., :min_len]
             y_clean = y_clean[..., :min_len]
+
+            if _profile:
+                torch.cuda.synchronize()
+                _t_data = time.perf_counter() - _t0
+                _t1 = time.perf_counter()
 
             # ----------------------------------------------------------------
             # Extract features (mel on GPU; F0 precomputed by WORLD)
@@ -299,6 +321,11 @@ def train(args):
                         mode="linear",
                         align_corners=False,
                     ).squeeze(1)
+
+            if _profile:
+                torch.cuda.synchronize()
+                _t_mel = time.perf_counter() - _t1
+                _t2 = time.perf_counter()
 
             # ----------------------------------------------------------------
             # Train Discriminator
@@ -321,6 +348,11 @@ def train(args):
             scaler.unscale_(opt_d)
             torch.nn.utils.clip_grad_norm_(discriminator.parameters(), config.grad_clip)
             scaler.step(opt_d)
+
+            if _profile:
+                torch.cuda.synchronize()
+                _t_dsc = time.perf_counter() - _t2
+                _t3 = time.perf_counter()
 
             # ----------------------------------------------------------------
             # Train Generator
@@ -358,6 +390,10 @@ def train(args):
             scaler.step(opt_g)
             scaler.update()
 
+            if _profile:
+                torch.cuda.synchronize()
+                _t_gen = time.perf_counter() - _t3
+
             # Logging
             epoch_loss_g += loss_g.item()
             epoch_loss_d += loss_d.item()
@@ -370,11 +406,25 @@ def train(args):
                 writer.add_scalar("train/loss_adv", loss_adv.item(), global_step)
                 writer.add_scalar("train/lr", opt_g.param_groups[0]["lr"], global_step)
 
-            pbar.set_postfix(
-                g=f"{loss_g.item():.2f}",
-                d=f"{loss_d.item():.2f}",
-                mel=f"{loss_mel.item():.1f}",
-            )
+            if _profile:
+                writer.add_scalar("profile/data_ms", _t_data * 1000, global_step)
+                writer.add_scalar("profile/mel_ms", _t_mel * 1000, global_step)
+                writer.add_scalar("profile/disc_ms", _t_dsc * 1000, global_step)
+                writer.add_scalar("profile/gen_ms", _t_gen * 1000, global_step)
+                pbar.set_postfix(
+                    g=f"{loss_g.item():.2f}",
+                    d=f"{loss_d.item():.2f}",
+                    io=f"{_t_data*1000:.0f}ms",
+                    ml=f"{_t_mel*1000:.0f}ms",
+                    dc=f"{_t_dsc*1000:.0f}ms",
+                    gn=f"{_t_gen*1000:.0f}ms",
+                )
+            else:
+                pbar.set_postfix(
+                    g=f"{loss_g.item():.2f}",
+                    d=f"{loss_d.item():.2f}",
+                    mel=f"{loss_mel.item():.1f}",
+                )
             global_step += 1
 
         scheduler_g.step()
@@ -442,7 +492,7 @@ if __name__ == "__main__":
                         help="Learning rate")
     parser.add_argument("--device", default=None,
                         help="Device: cuda / cpu")
-    parser.add_argument("--num_workers", type=int, default=2,
+    parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader workers")
 
     args = parser.parse_args()
