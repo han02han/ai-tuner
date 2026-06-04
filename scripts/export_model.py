@@ -12,7 +12,8 @@ def main():
     args = parser.parse_args()
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
-    gen = create_generator()
+    has_hubert = any("hubert_proj" in k for k in ckpt["generator"])
+    gen = create_generator(hubert_dim=768 if has_hubert else 0)
     gen.load_state_dict(ckpt["generator"])
     gen.remove_weight_norm()
 

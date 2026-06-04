@@ -48,10 +48,13 @@ class TrainConfig:
     hop_length: int = 256
     segment_ms: int = 800  # training segment duration in ms
 
-    # Mel spectrogram
+    # Mel spectrogram (for loss function only)
     mel_bins: int = 80
     n_fft: int = 1024
     win_length: int = 1024
+
+    # HuBERT content features
+    hubert_dim: int = 768
 
     # Model
     h_channels: int = 512
@@ -85,18 +88,29 @@ class TrainConfig:
 # ---------------------------------------------------------------------------
 
 class PairedVocalDataset(Dataset):
-    """Dataset of (out_of_tune, clean) vocal pairs."""
+    """Dataset of (hubert_feat, clean_audio, target_f0) triples.
 
-    def __init__(self, data_dir: str, segment_ms: int = 800, sample_rate: int = 22050):
+    HuBERT features are precomputed & cached by generate_training_data.py.
+    """
+
+    def __init__(self, data_dir: str, segment_ms: int = 800,
+                 sample_rate: int = 22050, hubert_dim: int = 768):
         self.data_dir = Path(data_dir)
         self.segment_samples = int(segment_ms / 1000.0 * sample_rate)
         self.sample_rate = sample_rate
+        self.hubert_dim = hubert_dim
 
         with open(self.data_dir / "metadata.json") as f:
             self.metadata = json.load(f)
 
-        self.pairs = self.metadata["pairs"]
+        self.pairs = [p for p in self.metadata["pairs"] if p.get("hubert")]
         self.pairs_dir = self.data_dir / "pairs"
+
+        if not self.pairs:
+            raise RuntimeError(
+                "No pairs with cached HuBERT features found. "
+                "Run generate_training_data.py with --use_hubert first."
+            )
 
     def __len__(self):
         return len(self.pairs)
@@ -106,88 +120,63 @@ class PairedVocalDataset(Dataset):
 
         pair = self.pairs[idx]
         clean_path = self.pairs_dir / pair["clean"]
-        shifted_path = self.pairs_dir / pair["shifted"]
+        hubert_path = self.pairs_dir / pair["hubert"]
 
+        # Load clean audio (target waveform for mel loss)
         y_clean, _ = sf.read(str(clean_path))
-        y_shifted, _ = sf.read(str(shifted_path))
 
-        # Load precomputed WORLD F0 (stored as float32 .npy)
+        # Load cached HuBERT features (T_hubert, 768)
+        hubert_full = np.load(str(hubert_path))
+
+        # Load precomputed WORLD F0 (Hz, WORLD frame rate ~200Hz)
         f0_path = self.pairs_dir / pair["f0"]
         f0_full = np.load(str(f0_path))
 
-        # Ensure same length
-        min_len = min(len(y_clean), len(y_shifted))
-        y_clean = y_clean[:min_len]
-        y_shifted = y_shifted[:min_len]
-
-        # Random segment or pad (keep F0 aligned with audio)
+        # Random segment
+        min_len = len(y_clean)
         if min_len >= self.segment_samples:
             start = random.randint(0, min_len - self.segment_samples)
             y_clean = y_clean[start:start + self.segment_samples]
-            y_shifted = y_shifted[start:start + self.segment_samples]
 
-            # Slice F0: convert sample index to frame index (5ms hop = sample_rate * 0.005)
-            frame_period = int(self.sample_rate * 0.005)
-            f0_start = start // frame_period
-            f0_end = (start + self.segment_samples + frame_period - 1) // frame_period
+            # Slice HuBERT: 50Hz frame rate
+            hubert_fps = 50.0
+            hubert_start = int(start / self.sample_rate * hubert_fps)
+            hubert_end = int((start + self.segment_samples) / self.sample_rate * hubert_fps)
+            hubert_full = hubert_full[hubert_start:hubert_end]
+
+            # Slice F0: 200Hz frame rate (5ms period)
+            f0_fps = 200.0
+            f0_start = int(start / self.sample_rate * f0_fps)
+            f0_end = int((start + self.segment_samples) / self.sample_rate * f0_fps)
             f0_full = f0_full[f0_start:f0_end]
-            expected_f0_frames = (self.segment_samples + frame_period - 1) // frame_period
-            if f0_full.shape[0] < expected_f0_frames:
-                f0_full = np.pad(f0_full, (0, expected_f0_frames - f0_full.shape[0]))
-            else:
-                f0_full = f0_full[:expected_f0_frames]
         else:
             y_clean = np.pad(y_clean, (0, self.segment_samples - min_len))
-            y_shifted = np.pad(y_shifted, (0, self.segment_samples - min_len))
+
+        # Pad/truncate HuBERT to expected frame count
+        expected_h_frames = int(self.segment_samples / self.sample_rate * 50.0) + 1
+        if hubert_full.shape[0] < expected_h_frames:
+            hubert_full = np.pad(hubert_full,
+                                 ((0, expected_h_frames - hubert_full.shape[0]), (0, 0)))
+        else:
+            hubert_full = hubert_full[:expected_h_frames]
+        hubert_feat = hubert_full.T  # (768, T) for Conv1d input
+
+        # Pad/truncate F0 to match (F0 at 200Hz, HuBERT at 50Hz — F0 is longer)
+        expected_f0_frames = int(self.segment_samples / self.sample_rate * 200.0) + 1
+        if f0_full.shape[0] < expected_f0_frames:
+            f0_full = np.pad(f0_full, (0, expected_f0_frames - f0_full.shape[0]))
+        else:
+            f0_full = f0_full[:expected_f0_frames]
 
         return (
-            torch.from_numpy(y_shifted).float(),
-            torch.from_numpy(y_clean).float(),
-            torch.from_numpy(f0_full).float(),
+            torch.from_numpy(hubert_feat).float(),         # (768, T)
+            torch.from_numpy(y_clean.squeeze()).float(),   # (T_audio,)
+            torch.from_numpy(f0_full).float(),             # (T_f0,)
         )
 
 
 # ---------------------------------------------------------------------------
 # Mel & pitch extraction
-# ---------------------------------------------------------------------------
-
-# Cached mel filter banks: keyed by (sr, n_fft, n_mels, device)
-_mel_basis_cache: dict = {}
-
-def extract_mel(y: torch.Tensor, sr: int, n_fft: int, hop: int, win: int,
-                n_mels: int) -> torch.Tensor:
-    """Extract log-mel spectrogram from waveform."""
-    window = torch.hann_window(win, device=y.device)
-    spec = torch.stft(y, n_fft, hop, win, window, return_complex=True).abs()
-    spec = spec ** 2  # power spectrum
-
-    cache_key = (sr, n_fft, n_mels, y.device)
-    if cache_key not in _mel_basis_cache:
-        from librosa.filters import mel as mel_fn
-        _mel_basis_cache[cache_key] = torch.from_numpy(
-            mel_fn(sr=sr, n_fft=n_fft, n_mels=n_mels)
-        ).float().to(y.device)
-    mel_basis = _mel_basis_cache[cache_key]
-
-    mel = torch.matmul(mel_basis, spec)
-    mel = torch.log(torch.clamp(mel, min=1e-5))
-    return mel
-
-
-def extract_pitch(y: np.ndarray, sr: int, hop_length: int) -> np.ndarray:
-    """Extract pitch contour using pYIN (returns Hz, 0 for unvoiced)."""
-    import librosa
-    f0, voiced_flag, _ = librosa.pyin(
-        y, fmin=librosa.note_to_hz("E2"),
-        fmax=librosa.note_to_hz("C6"),
-        sr=sr, hop_length=hop_length,
-    )
-    f0 = np.nan_to_num(f0, nan=0.0)
-    return f0.astype(np.float32)
-
-
-# ---------------------------------------------------------------------------
-# Training
 # ---------------------------------------------------------------------------
 
 def train(args):
@@ -206,6 +195,7 @@ def train(args):
         args.data_dir,
         segment_ms=config.segment_ms,
         sample_rate=config.sample_rate,
+        hubert_dim=config.hubert_dim,
     )
     dataloader = DataLoader(
         dataset,
@@ -223,6 +213,7 @@ def train(args):
     generator = create_generator(
         mel_bins=config.mel_bins,
         pitch_bins=config.pitch_bins,
+        hubert_dim=config.hubert_dim,
         h_channels=config.h_channels,
     ).to(device)
 
@@ -289,14 +280,10 @@ def train(args):
             if _profile:
                 _t0 = time.perf_counter()
 
-            y_shifted, y_clean, target_f0 = batch
-            y_shifted = y_shifted.to(device)
+            hubert_feat, y_clean, target_f0 = batch
+            hubert_feat = hubert_feat.to(device)
             y_clean = y_clean.to(device)
             target_f0 = target_f0.to(device)
-            # Align lengths: dataset may return slightly different durations
-            min_len = min(y_shifted.shape[-1], y_clean.shape[-1])
-            y_shifted = y_shifted[..., :min_len]
-            y_clean = y_clean[..., :min_len]
 
             if _profile:
                 torch.cuda.synchronize()
@@ -304,23 +291,16 @@ def train(args):
                 _t1 = time.perf_counter()
 
             # ----------------------------------------------------------------
-            # Extract features (mel on GPU; F0 precomputed by WORLD)
+            # HuBERT features are precomputed & cached; F0 resampled to match
             # ----------------------------------------------------------------
-            with torch.no_grad():
-                mel_shifted = extract_mel(
-                    y_shifted, config.sample_rate, config.n_fft,
-                    config.hop_length, config.win_length, config.mel_bins,
-                )
-
-                # Resample precomputed F0 to match mel frame count
-                mel_frames = mel_shifted.shape[2]
-                if target_f0.shape[-1] != mel_frames:
-                    target_f0 = F.interpolate(
-                        target_f0.unsqueeze(1),
-                        size=mel_frames,
-                        mode="linear",
-                        align_corners=False,
-                    ).squeeze(1)
+            h_frames = hubert_feat.shape[2]
+            if target_f0.shape[-1] != h_frames:
+                target_f0 = F.interpolate(
+                    target_f0.unsqueeze(1),
+                    size=h_frames,
+                    mode="linear",
+                    align_corners=False,
+                ).squeeze(1)
 
             if _profile:
                 torch.cuda.synchronize()
@@ -334,7 +314,7 @@ def train(args):
 
             with torch.no_grad():
                 with torch.cuda.amp.autocast():
-                    y_gen = generator(mel_shifted, target_f0)
+                    y_gen = generator(hubert_feat, target_f0)
                 y_gen = y_gen[..., :y_clean.shape[-1]]
 
             mpd_real, msd_real = discriminator(y_clean.unsqueeze(1))
@@ -360,7 +340,7 @@ def train(args):
             opt_g.zero_grad()
 
             with torch.cuda.amp.autocast():
-                y_gen = generator(mel_shifted, target_f0)
+                y_gen = generator(hubert_feat, target_f0)
             y_gen = y_gen[..., :y_clean.shape[-1]]
 
             mpd_fake, msd_fake = discriminator(y_gen.float())
@@ -415,7 +395,7 @@ def train(args):
                     g=f"{loss_g.item():.2f}",
                     d=f"{loss_d.item():.2f}",
                     io=f"{_t_data*1000:.0f}ms",
-                    ml=f"{_t_mel*1000:.0f}ms",
+                    hf=f"{_t_mel*1000:.0f}ms",
                     dc=f"{_t_dsc*1000:.0f}ms",
                     gn=f"{_t_gen*1000:.0f}ms",
                 )

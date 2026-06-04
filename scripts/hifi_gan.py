@@ -84,34 +84,46 @@ class MRF(nn.Module):
 # ---------------------------------------------------------------------------
 
 class HiFiGANGenerator(nn.Module):
-    """HiFi-GAN generator with optional pitch conditioning.
+    """HiFi-GAN generator with optional pitch and HuBERT conditioning.
+
+    Supports two input modes:
+    1. mel + pitch (legacy): input channels = mel_bins + pitch_bins
+    2. hubert + pitch (new): hubert features (768d) projected to h_channels//2,
+       then concat with pitch => total = h_channels//2 + pitch_bins
 
     Args:
-        mel_bins: number of mel frequency bins (default 80)
+        mel_bins: number of mel frequency bins (default 80, used when hubert_dim=0)
         pitch_bins: number of pitch feature channels (default 1, set 0 to disable)
+        hubert_dim: HuBERT feature dimension (default 768, set 0 to use mel input)
         h_channels: hidden channels after pre-conv (default 512)
         upsample_rates: upsampling factors per block
         upsample_kernel_sizes: kernel sizes for upsampling convolutions
-        resblock_kernel_sizes: kernel sizes for MRF residual blocks
-        resblock_dilations: dilation patterns for MRF residual blocks
+        upsample_initial_channel: hidden channels before first upsampling
     """
 
     def __init__(
         self,
         mel_bins: int = 80,
         pitch_bins: int = 1,
+        hubert_dim: int = 0,
         h_channels: int = 512,
         upsample_rates: tuple = (8, 8, 2, 2),
         upsample_kernel_sizes: tuple = (16, 16, 4, 4),
         upsample_initial_channel: int = 256,
-        resblock_kernel_sizes: tuple = (3, 7, 11),
-        resblock_dilations: tuple = ((1, 3, 5), (1, 3, 5), (1, 3, 5)),
     ):
         super().__init__()
 
         self.mel_bins = mel_bins
         self.pitch_bins = pitch_bins
-        self.input_channels = mel_bins + pitch_bins
+        self.hubert_dim = hubert_dim
+
+        if hubert_dim > 0:
+            # HuBERT mode: project 768-dim HuBERT features → h_channels//2
+            self.hubert_proj = nn.Conv1d(hubert_dim, h_channels // 2, kernel_size=1)
+            self.input_channels = h_channels // 2 + pitch_bins
+        else:
+            # Legacy mode: direct mel input
+            self.input_channels = mel_bins + pitch_bins
 
         # Pre-convolution: input → hidden
         self.conv_pre = weight_norm(nn.Conv1d(
@@ -145,54 +157,68 @@ class HiFiGANGenerator(nn.Module):
 
         self.apply(init_weights)
 
-    def _make_pitch_feature(self, pitch_hz: torch.Tensor, mel_length: int) -> torch.Tensor:
-        """Convert pitch contour to a feature map that can be concatenated with mel.
+    def _make_pitch_feature(self, pitch_hz: torch.Tensor, n_frames: int) -> torch.Tensor:
+        """Convert pitch contour to a feature map.
 
         Args:
             pitch_hz: (B, T) pitch values in Hz, 0 where unvoiced
-            mel_length: target mel frame count
+            n_frames: target frame count
 
         Returns:
-            pitch_feat: (B, 1, T_mel) normalized pitch feature
+            pitch_feat: (B, 1, n_frames) normalized pitch feature in [-1, 1]
         """
         B, T = pitch_hz.shape
 
-        # Interpolate to mel length
-        if T != mel_length:
+        # Interpolate to target frame count
+        if T != n_frames:
             pitch_hz = F.interpolate(
                 pitch_hz.unsqueeze(1),
-                size=mel_length,
+                size=n_frames,
                 mode="linear",
                 align_corners=False,
             ).squeeze(1)
 
-        # Normalize: map to [-1, 1] range
-        # Mel bins typically 0-80; target pitch roughly 80-1000 Hz
-        # Use log-scale normalization
-        pitch_feat = torch.zeros(B, 1, mel_length, device=pitch_hz.device)
+        # Normalize: log2(hz/440) → tanh(x/4.0) → [-1, 1]
+        pitch_feat = torch.zeros(B, 1, n_frames, device=pitch_hz.device)
         voiced = pitch_hz > 20.0
         if voiced.any():
-            log_pitch = torch.log2(torch.clamp(pitch_hz, min=20.0) / 440.0)  # normalize around A4
-            pitch_feat[:, 0, :] = torch.tanh(log_pitch / 4.0)  # compress to [-1, 1]
+            log_pitch = torch.log2(torch.clamp(pitch_hz, min=20.0) / 440.0)
+            pitch_feat[:, 0, :] = torch.tanh(log_pitch / 4.0)
 
         return pitch_feat
 
-    def forward(self, mel: torch.Tensor, pitch: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, input_feat: torch.Tensor, pitch: torch.Tensor | None = None) -> torch.Tensor:
         """Forward pass.
 
+        In mel mode (hubert_dim=0):
+            input_feat: (B, mel_bins, T) mel spectrogram
+        In HuBERT mode (hubert_dim > 0):
+            input_feat: (B, hubert_dim, T) HuBERT features
+
         Args:
-            mel: (B, mel_bins, T) mel spectrogram
+            input_feat: content features (mel or HuBERT)
             pitch: (B, T_pitch) pitch contour in Hz, or None to skip conditioning
 
         Returns:
             wav: (B, 1, T_audio) generated waveform
         """
-        if pitch is not None:
-            pitch_feat = self._make_pitch_feature(pitch, mel.shape[2])
-            x = torch.cat([mel, pitch_feat], dim=1)
+        n_frames = input_feat.shape[2]
+
+        if self.hubert_dim > 0:
+            # HuBERT mode: project then concat pitch
+            x = F.leaky_relu(self.hubert_proj(input_feat), 0.1)
+            if pitch is not None:
+                pitch_feat = self._make_pitch_feature(pitch, n_frames)
+                x = torch.cat([x, pitch_feat], dim=1)
+            else:
+                x = torch.cat([x, torch.zeros(x.shape[0], 1, n_frames, device=x.device)], dim=1)
         else:
-            # Pad with zeros if no pitch provided
-            x = torch.cat([mel, torch.zeros(mel.shape[0], 1, mel.shape[2], device=mel.device)], dim=1)
+            # Legacy mel mode
+            if pitch is not None:
+                pitch_feat = self._make_pitch_feature(pitch, n_frames)
+                x = torch.cat([input_feat, pitch_feat], dim=1)
+            else:
+                x = torch.cat([input_feat, torch.zeros(input_feat.shape[0], 1, n_frames, device=input_feat.device)], dim=1)
 
         x = self.conv_pre(x)
 
@@ -412,17 +438,22 @@ def generator_loss(fake_scores) -> torch.Tensor:
 def create_generator(
     mel_bins: int = 80,
     pitch_bins: int = 1,
+    hubert_dim: int = 0,
     h_channels: int = 512,
     upsample_rates: tuple = (8, 8, 2, 2),
 ) -> HiFiGANGenerator:
-    """Create a HiFi-GAN generator with default config for 22kHz audio.
+    """Create a HiFi-GAN generator.
 
-    22050 Hz * (1/256) hop = ~86 Hz mel frame rate
-    86 * 8 * 8 * 2 * 2 = 22050 Hz audio
+    Default config generates 22kHz audio from ~86 Hz frame rate.
+    86 * 8 * 8 * 2 * 2 = 22050 Hz.
+
+    When hubert_dim > 0 (e.g. 768), HuBERT projection layer is added
+    and mel_bins is ignored.
     """
     return HiFiGANGenerator(
         mel_bins=mel_bins,
         pitch_bins=pitch_bins,
+        hubert_dim=hubert_dim,
         h_channels=h_channels,
         upsample_rates=upsample_rates,
         upsample_kernel_sizes=(16, 16, 4, 4),

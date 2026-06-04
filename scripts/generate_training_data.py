@@ -1,11 +1,12 @@
 """
-Generate paired training data for neural pitch correction using WORLD vocoder.
+Generate paired training data for neural pitch correction using WORLD vocoder
++ HuBERT content features.
 
 Takes clean vocal audio files and produces paired (out_of_tune, clean)
 training examples by applying controlled random pitch deviations.
 
-WORLD analysis (expensive) is done once per input file. Each training pair
-randomly selects a segment, applies a single pitch shift, and synthesizes.
+WORLD analysis (expensive) is done once per input file. HuBERT features are
+extracted once per file and sliced per segment.
 
 Supports multi-threaded file processing via --num_workers. pyworld C functions
 release the GIL, so I/O and WORLD synthesis scale across threads.
@@ -50,13 +51,54 @@ def _apply_pitch_shift(
     return f0_new, sp_seg
 
 
+# ---------------------------------------------------------------------------
+# HuBERT feature extraction (global singleton to avoid reload)
+# ---------------------------------------------------------------------------
+
+_HUBERT_CACHE: dict = {}
+
+
+def _get_hubert_model(device="cpu"):
+    """Load HuBERT model lazily (cached after first call)."""
+    key = f"hubert::{device}"
+    if key not in _HUBERT_CACHE:
+        from transformers import HubertModel, Wav2Vec2FeatureExtractor
+        _HUBERT_CACHE["extractor"] = Wav2Vec2FeatureExtractor.from_pretrained(
+            "facebook/hubert-base-ls960")
+        _HUBERT_CACHE[key] = HubertModel.from_pretrained(
+            "facebook/hubert-base-ls960").to(device).eval()
+    return _HUBERT_CACHE["extractor"], _HUBERT_CACHE[key]
+
+
+def _extract_hubert_features(y: np.ndarray, sr: int, device="cpu") -> np.ndarray:
+    """Extract HuBERT features from audio.
+
+    Args:
+        y: audio waveform (float32, mono)
+        sr: sample rate (must be 16000 for base HuBERT)
+
+    Returns:
+        features: (T, 768) HuBERT features at 50 Hz frame rate
+    """
+    extractor, model = _get_hubert_model(device)
+    # HuBERT expects 16kHz
+    if sr != 16000:
+        import librosa
+        y = librosa.resample(y, orig_sr=sr, target_sr=16000)
+    inputs = extractor(y, sampling_rate=16000, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model(**{k: v.to(device) for k, v in inputs.items()})
+    return outputs.last_hidden_state.squeeze(0).cpu().numpy()
+
+
 def _process_file(args):
     """Process a single audio file: WORLD analysis + generate pairs.
 
     Runs in a worker thread. Returns (file_name, pairs_metadata, pair_count).
     """
     (audio_file, pairs_dir, base_idx, pairs_per_file, max_shift_cents,
-     target_sr, max_duration_sec, formant_shift_ratio, min_clean_ratio) = args
+     target_sr, max_duration_sec, formant_shift_ratio, min_clean_ratio,
+     use_hubert) = args
     pairs_dir = Path(pairs_dir)
 
     try:
@@ -142,11 +184,22 @@ def _process_file(args):
             sf.write(str(shifted_path), y_shifted, sr)
             np.save(str(f0_path), f0_seg.astype(np.float32))
 
+            hubert_path_str = ""
+            if use_hubert:
+                hubert_path = pairs_dir / f"{global_id:05d}_hubert.npy"
+                try:
+                    hubert_feats = _extract_hubert_features(y_shifted, sr)
+                    np.save(str(hubert_path), hubert_feats.astype(np.float32))
+                    hubert_path_str = str(hubert_path.name)
+                except Exception as e:
+                    print(f"  HuBERT extraction failed for pair {global_id}: {e}")
+
             pairs_metadata.append({
                 "id": global_id,
                 "clean": str(clean_path.name),
                 "shifted": str(shifted_path.name),
                 "f0": str(f0_path.name),
+                "hubert": hubert_path_str if use_hubert else "",
                 "source_file": audio_file.name,
                 "duration_sec": round(min_len / sr, 2),
             })
@@ -165,13 +218,14 @@ def _process_file(args):
 def generate_dataset(
     input_dir: str,
     output_dir: str,
-    pairs_per_file: int = 30,
+    pairs_per_file: int = 20,
     max_shift_cents: float = 300.0,
     target_sr: int = 22050,
     max_duration_sec: float = 15.0,
     formant_shift_ratio: float = 0.4,
     min_clean_ratio: float = 0.05,
     num_workers: int = 1,
+    use_hubert: bool = True,
 ):
     input_path = Path(input_dir)
     output_path = Path(output_dir)
@@ -198,6 +252,7 @@ def generate_dataset(
             audio_file, str(pairs_dir), i * pairs_per_file,
             pairs_per_file, max_shift_cents, target_sr,
             max_duration_sec, formant_shift_ratio, min_clean_ratio,
+            use_hubert,
         ))
 
     metadata = {
@@ -206,6 +261,8 @@ def generate_dataset(
         "max_shift_cents": max_shift_cents,
         "vocoder": "WORLD",
         "formant_shift_ratio": formant_shift_ratio,
+        "use_hubert": use_hubert,
+        "hubert_model": "facebook/hubert-base-ls960" if use_hubert else "",
         "source_files": [str(f.name) for f in audio_files],
         "pairs": [],
     }
@@ -275,6 +332,8 @@ if __name__ == "__main__":
                              "0.4=moderate, 1.0=full coupling)")
     parser.add_argument("--num_workers", type=int, default=1,
                         help="Number of parallel worker threads")
+    parser.add_argument("--use_hubert", action="store_true", default=True,
+                        help="Extract HuBERT features for each pair (requires transformers)")
     args = parser.parse_args()
 
     generate_dataset(
@@ -286,4 +345,5 @@ if __name__ == "__main__":
         max_duration_sec=args.max_duration_sec,
         formant_shift_ratio=args.formant_shift_ratio,
         num_workers=args.num_workers,
+        use_hubert=args.use_hubert,
     )

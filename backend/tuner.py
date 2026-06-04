@@ -35,15 +35,19 @@ from scipy.ndimage import median_filter
 # Per-frame pitch shifting (segmented, for pyrb 0.4+ which only takes scalar)
 # ---------------------------------------------------------------------------
 
+# Shared pyrubberband options for high-quality vocal pitch correction
+_RB_ARGS = {"--formant": "", "--pitch-hq": ""}
+
+
 def _apply_per_frame_pitch_shift(
     y: np.ndarray, sr: int, shifts_cents: np.ndarray,
     hop_length: int = 256, min_segment_ms: int = 50,
 ) -> np.ndarray:
-    """Apply per-frame pitch shifts by processing in segments.
+    """Apply per-frame pitch shifts by processing in segments with crossfade.
 
     pyrubberband 0.4+ only accepts scalar n_steps, so we group
     consecutive frames with similar corrections into segments,
-    apply the median shift to each, and crossfade.
+    apply the median shift to each, and crossfade boundaries.
 
     Args:
         y: audio waveform
@@ -76,43 +80,74 @@ def _apply_per_frame_pitch_shift(
         else:
             merged.append(b)
 
-    # Process each segment
-    output = np.zeros_like(y)
-    fade_len = min(256, len(y) // 16)  # 256-sample crossfade
+    # Single segment: process whole audio at once, no crossfade needed
+    if len(merged) == 2:
+        seg_shift = np.median(shifts_cents)
+        if abs(seg_shift) < 2.0:
+            return y
+        try:
+            return pyrb.pitch_shift(y, sr, seg_shift / 100.0, rbargs=_RB_ARGS)
+        except Exception:
+            return y
 
-    prev_end_sample = 0
+    # Build segment list with sample positions
+    segments = []
     for seg_idx in range(len(merged) - 1):
         f_start = merged[seg_idx]
         f_end = merged[seg_idx + 1]
-
         s_start = f_start * hop_length
         s_end = min(len(y), f_end * hop_length)
-
         if s_end <= s_start:
             continue
-
         seg_shift = np.median(shifts_cents[f_start:f_end])
-        if abs(seg_shift) < 2.0:
-            # Too small to shift, copy as-is
-            output[s_start:s_end] = y[s_start:s_end]
+        segments.append((s_start, s_end, seg_shift))
+
+    if not segments:
+        return y
+
+    fade_len = min(256, len(y) // 16)
+    output = np.zeros(len(y), dtype=np.float64)
+    weight_sum = np.zeros(len(y), dtype=np.float64)
+
+    for i, (s_start, s_end, shift) in enumerate(segments):
+        # Extend by fade_len for crossfade overlap (except first/last segment)
+        ext_start = max(0, s_start - fade_len) if i > 0 else s_start
+        ext_end = min(len(y), s_end + fade_len) if i < len(segments) - 1 else s_end
+
+        seg_in = y[ext_start:ext_end]
+
+        if abs(shift) < 2.0:
+            seg_out = seg_in.copy()
         else:
-            seg_in = y[s_start:s_end]
             try:
-                seg_out = pyrb.pitch_shift(seg_in, sr, seg_shift / 100.0)
+                seg_out = pyrb.pitch_shift(
+                    seg_in, sr, shift / 100.0, rbargs=_RB_ARGS)
             except Exception:
-                seg_out = seg_in  # fallback: skip this segment
+                seg_out = seg_in.copy()
 
-            # Trim to match
-            copy_len = min(len(seg_out), len(seg_in))
-            output[s_start:s_start + copy_len] = seg_out[:copy_len]
+        # Trim to expected extension length
+        min_len = min(len(seg_out), len(seg_in))
+        seg_out = seg_out[:min_len]
 
-        prev_end_sample = s_end
+        # Build crossfade window: 1.0 in core, fade at edges
+        n = min_len
+        window = np.ones(n, dtype=np.float64)
+        if i > 0:
+            f = min(fade_len, n)
+            window[:f] = np.linspace(0, 1, f)
+        if i < len(segments) - 1:
+            f = min(fade_len, n)
+            window[-f:] = np.linspace(1, 0, f)
 
-    # Fill trailing silence
-    if prev_end_sample < len(y):
-        output[prev_end_sample:] = y[prev_end_sample:]
+        output[ext_start:ext_start + n] += seg_out * window
+        weight_sum[ext_start:ext_start + n] += window
 
-    return output
+    # Normalize overlapping regions, fallback to original in uncovered gaps
+    mask = weight_sum > 0
+    output[mask] /= weight_sum[mask]
+    output[~mask] = y[~mask]
+
+    return output.astype(y.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -535,9 +570,14 @@ def tune_neural(
     # Smooth target pitch contour to avoid abrupt corrections
     target_pitch = _smooth_pitch_contour(target_pitch, kernel=5)
 
+    # Blend target pitch with original based on correction_strength
     for i in range(len(f0)):
         if voiced_flag[i] and np.isfinite(f0[i]) and target_pitch[i] > 0:
-            pitch_shifts_cents[i] = hz_to_cents(target_pitch[i], f0[i]) * correction_strength
+            shift_cents = hz_to_cents(target_pitch[i], f0[i])
+            pitch_shifts_cents[i] = shift_cents * correction_strength
+            # Interpolate target pitch: original → snapped, by strength
+            blended_cents = shift_cents * correction_strength
+            target_pitch[i] = f0[i] * (2.0 ** (blended_cents / 1200.0))
 
     # ---- Neural vocoder inference ----
     y_tensor = torch.from_numpy(y).float().unsqueeze(0).to(device)
@@ -545,18 +585,20 @@ def tune_neural(
 
     with torch.no_grad():
         # Extract mel from the out-of-tune audio (carries content/timbre)
-        from neural_vocoder import extract_mel_torch
-        mel = extract_mel_torch(y_tensor, sr, n_fft=1024, hop=hop_length, win=1024)
+        from neural_vocoder import extract_hubert_features
+        # extract_hubert_features returns (768, T), add batch dim → (1, 768, T)
+        hubert = extract_hubert_features(y_tensor, sr).unsqueeze(0)
 
-        # Align pitch length to mel frames
-        if target_pitch_tensor.shape[1] > mel.shape[2]:
-            target_pitch_tensor = target_pitch_tensor[:, :mel.shape[2]]
-        elif target_pitch_tensor.shape[1] < mel.shape[2]:
+        # Align pitch length to hubert frames
+        h_frames = hubert.shape[2]
+        if target_pitch_tensor.shape[1] > h_frames:
+            target_pitch_tensor = target_pitch_tensor[:, :h_frames]
+        elif target_pitch_tensor.shape[1] < h_frames:
             target_pitch_tensor = torch.nn.functional.pad(
-                target_pitch_tensor, (0, mel.shape[2] - target_pitch_tensor.shape[1]))
+                target_pitch_tensor, (0, h_frames - target_pitch_tensor.shape[1]))
 
         # Generate corrected waveform
-        y_corrected_tensor = model(mel, target_pitch_tensor)
+        y_corrected_tensor = model(hubert, target_pitch_tensor)
 
     y_corrected = y_corrected_tensor.squeeze().cpu().numpy()
 
