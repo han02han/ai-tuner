@@ -26,7 +26,7 @@
 |------|------|---------|
 | **DSP 音阶** | 自动检测调性，将每个音拉到最近的调内音（pyrubberband） | 不知道原唱、没有参考音频 |
 | **DSP 参考音频** | DTW 对齐原唱音高，拉到对应的目标音高（pyrubberband） | 有原唱/标准版本，修得更准 |
-| **AI 神经网络** | HiFi-GAN vocoder 按目标音高重建波形，音高和共振峰一起生成 | 跑调严重也能保持音色自然 |
+| **AI 神经网络** | HiFi-GAN vocoder + HuBERT 特征，按目标音高重建波形 | 跑调严重也能保持音色自然 |
 
 ## 节奏修正
 
@@ -47,8 +47,8 @@
 - **音高检测**: pYIN (librosa)
 - **调性识别**: Krumhansl-Schmuckler 算法
 - **时间对齐**: DTW (Dynamic Time Warping) — 音高对齐 + 节奏对齐
-- **DSP 音高搬移**: Rubber Band Library (pyrubberband)
-- **AI 音频重建**: HiFi-GAN vocoder with pitch conditioning（PyTorch）
+- **DSP 音高搬移**: Rubber Band Library (pyrubberband)，启用 `--formant` 和 `--pitch-hq` 选项
+- **AI 音频重建**: HiFi-GAN vocoder + HuBERT content encoder（PyTorch）
 - **训练数据生成**: WORLD vocoder — 分离 F0/频谱包络/非周期性，独立偏移
 - **后端**: FastAPI (Python)
 - **前端**: 原生 HTML/CSS/JS，零依赖
@@ -58,22 +58,24 @@
 ```
 ai-tuner/
 ├── backend/
-│   ├── app.py                 # FastAPI 服务入口（5 个 API）
+│   ├── app.py                 # FastAPI 服务入口（端口 8050）
 │   ├── tuner.py               # 3 条修音管线 + 节奏预处理 + 后处理
 │   ├── pitch_detector.py      # 音高检测 & 调性识别
 │   ├── alignment.py           # DTW 音高对齐
 │   ├── rhythm_corrector.py    # 节奏修正（节拍网格 + DTW 参考对齐）
-│   ├── neural_vocoder.py      # HiFi-GAN 推理模型（加载 weights 用）
+│   ├── neural_vocoder.py      # HiFi-GAN + HuBERT 推理模型
 │   └── requirements.txt
 ├── scripts/
-│   ├── generate_training_data.py  # WORLD vocoder 把干净人声搞跑调 → 构造配对训练数据
-│   ├── hifi_gan.py                # HiFi-GAN 模型定义（Generator + Discriminator + Loss）
-│   ├── train.py                   # 训练脚本（对抗训练微调）
+│   ├── generate_training_data.py  # WORLD vocoder 生成配对训练数据
+│   ├── hifi_gan.py                # HiFi-GAN 模型定义
+│   ├── train.py                   # 训练脚本（TF32 + torch.compile 优化）
+│   ├── export_model.py            # 模型导出脚本
 │   └── requirements_train.txt
 ├── frontend/
 │   └── index.html              # 三栏 UI（DSP 修音 / 参考音频 / DSP vs AI 对比）
-├── data/clean/                 # ← 干净人声放这里
-├── data/training/              # ← generate_training_data.py 生成到这里
+├── data/
+│   ├── clean/                  # ← 干净人声放这里
+│   └── out_of_tune/            # ← 跑调数据生成目录
 ├── models/                     # ← tuner.pth 训练好放这里
 ├── checkpoints/                # 训练断点保存
 ├── outputs/                    # 处理后音频下载
@@ -86,10 +88,10 @@ ai-tuner/
 
 ```bash
 pip install -r backend/requirements.txt
-cd backend && uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+cd backend && uvicorn app:app --host 0.0.0.0 --port 8050 --reload
 ```
 
-打开 http://localhost:8000
+打开 http://localhost:8050
 
 ### 完整流程（从训练到部署）
 
@@ -102,13 +104,13 @@ pip install -r scripts/requirements_train.txt
 # 3. 生成配对训练数据（WORLD vocoder 故意搞跑调）
 python scripts/generate_training_data.py \
     --input_dir data/clean/ \
-    --output_dir data/training/ \
+    --output_dir data/out_of_tune/ \
     --pairs_per_file 20 \
     --formant_shift_ratio 0.4
 
-# 4. 训练模型
+# 4. 训练模型（启用 TF32 和 torch.compile）
 python scripts/train.py \
-    --data_dir data/training/ \
+    --data_dir data/out_of_tune/ \
     --checkpoint_dir checkpoints/ \
     --batch_size 8 \
     --num_epochs 100
@@ -116,7 +118,7 @@ python scripts/train.py \
 # 5. 模型自动导出到 models/tuner.pth
 
 # 6. 启动服务
-cd backend && uvicorn app:app --host 0.0.0.0 --port 8000
+cd backend && uvicorn app:app --host 0.0.0.0 --port 8050
 ```
 
 ## API
@@ -158,22 +160,28 @@ AI 神经网络修音（需 models/tuner.pth）。
 
 ## DSP vs 神经网络
 
-| | DSP（pyrubberband） | 神经网络（HiFi-GAN） |
+| | DSP（pyrubberband） | 神经网络（HiFi-GAN + HuBERT） |
 |---|---|---|
-| **原理** | 检测音高 → 频域拉伸搬移 | 提取 mel 频谱 + 目标音高 → vocoder 重建波形 |
+| **原理** | 检测音高 → 频域拉伸搬移 | 提取 HuBERT 特征 + 目标音高 → vocoder 重建波形 |
 | **共振峰** | 搬移音高分开了共振峰，跑调远了音色变形 | 音高和共振峰一起生成，音色自然 |
 | **跑调严重时** | 音色失真明显 | 能重新"唱"出来 |
 | **推理速度** | 毫秒级，纯 CPU | 秒级，GPU 加速 |
-| **依赖** | 数学库，几十 MB | 模型权重，~50 MB |
+| **依赖** | 数学库，几十 MB | 模型权重 + HuBERT，~500 MB |
 | **部署** | 零模型，直接跑 | 本地加载 .pth，不调任何外部 API |
+
+### 为什么 HuBERT 特征更好？
+
+HuBERT 是预训练的语音内容编码器，能够提取语音的高级语义特征（"在唱什么"），比传统的 Mel 频谱更能保留音色和情感信息。神经网络修音时：
+
+1. 用 HuBERT 提取输入音频的内容特征（不变）
+2. 用修正后的目标音高作为条件
+3. HiFi-GAN 根据内容和音高重建波形
+
+这样可以在改变音高的同时，最大限度保留原始音色和演唱风格。
 
 ### 为什么不能调大模型 API
 
 修音需要的是专用音频神经网络（vocoder），不是 LLM。LLM 的输入输出是文字，无法理解音频波形、音高、共振峰。修音用的音频模型是本地部署的——没有现成的 API 可以调。
-
-### 为什么神经网络能解决共振峰问题
-
-DSP 修音把人声拆成"音高"和"音色"两个独立的东西操作，但人声里两者是耦合的。神经 vocoder 不拆，直接从 mel 频谱 + 目标音高重建整个波形，音高和共鸣特征一起生成，不存在"移了 A 丢了 B"。
 
 ### 工程化难点
 
@@ -185,11 +193,16 @@ DSP 修音把人声拆成"音高"和"音色"两个独立的东西操作，但人
 
 ## 训练方案
 
-**基于 RVC 架构改造**（已落地为 scripts/train.py）：
+**基于 RVC 架构改造**：
 
 RVC 有三个模块：内容编码器（"在唱什么"）+ 音高编码器（"唱了多高"）+ HiFi-GAN 解码器（合并重建波形）。修音只需改动一处——把音高编码器提取的跑调音高替换成修正后的目标音高，内容和音色不变。
 
 **训练数据**：`generate_training_data.py` 用 WORLD vocoder 分离 F0/频谱包络/非周期性，独立偏移 F0 并联动共振峰来制造更真实的跑调数据。任何干净的人声都能用来生成无限量训练对。
+
+**训练优化**：
+- **TF32 加速**：启用 TensorFloat32 矩阵运算，显著提升训练速度
+- **torch.compile**：编译生成器和判别器，进一步优化性能
+- **Mel filter 缓存**：避免重复计算，加速数据加载
 
 **算力需求**：
 
@@ -211,7 +224,7 @@ RVC 有三个模块：内容编码器（"在唱什么"）+ 音高编码器（"�
 
 建议先下 M4Singer，男女声均衡、带乐谱标注、专业录音棚干声。
 
-## 设计讨论（2026-05-22）
+## 设计讨论
 
 ### 节奏修正
 
@@ -222,7 +235,7 @@ RVC 有三个模块：内容编码器（"在唱什么"）+ 音高编码器（"�
 - WORLD 把声音拆成 F0、频谱包络、非周期性三个独立组件
 - 训练数据生成时独立偏移 F0，共振峰按 `formant_shift_ratio` 联动偏移
 - 比 pyrubberband 频域搬移更接近真实跑调（真实跑调时共振峰也跟着偏移）
-- pyrubberband 继续用于 DSP 推理管线，两者各司其职
+- pyrubberband 继续用于 DSP 推理管线，启用高质量选项，两者各司其职
 
 ### 真跑调数据怎么用？（不能用 AI 输出当 target）
 
@@ -241,7 +254,7 @@ RVC 有三个模块：内容编码器（"在唱什么"）+ 音高编码器（"�
 | `models/tuner_female_only.pth` | OpenCpop (1 女声) | 仅女声，男声会出电音 | 已废弃 |
 | `models/tuner.pth` | 待训练 | 男女通用 | TODO |
 
-> **已知问题 2026-05-25**：仅用 OpenCpop 一个女歌手训练的模型对男声无效。AI vocoder 换到音域/音色不匹配的输入时输出噪声。需要多歌手数据重新训练。
+> **已知问题**：仅用单一歌手训练的模型泛化能力有限。需要多歌手数据重新训练。
 
 ## TODO
 
@@ -250,6 +263,8 @@ RVC 有三个模块：内容编码器（"在唱什么"）+ 音高编码器（"�
 - [x] ~~Pitch smoothing + 音量归一化后处理~~
 - [x] ~~全功能 Web UI（4 Tab：DSP 音阶 / 参考音频 / AI 修音 / DSP vs AI）~~
 - [x] ~~MP3/WAV/FLAC 多格式支持~~
+- [x] ~~HuBERT 特征提取替代 Mel 频谱~~
+- [x] ~~训练性能优化（TF32 + torch.compile）~~
 - [ ] **多歌手训练**：下载 M4Singer / OpenSinger，男女声混合 WORLD 生成配对数据，重训通用模型
 - [ ] 两阶段训练（真跑调数据微调、mel 一致性约束）
 - [ ] 人声/伴奏分离预处理（demucs），直接上传带伴奏的音频
@@ -257,3 +272,22 @@ RVC 有三个模块：内容编码器（"在唱什么"）+ 音高编码器（"�
 - [ ] 流式处理（WebSocket），边录边修
 - [ ] 前端波形对比（修前 vs 修后可视化）
 - [ ] 移动端适配
+
+## 更新日志
+
+### v0.3 (2026-06-04)
+- ✅ 改用 HuBERT 特征提取替代 Mel 频谱，提升音色保留效果
+- ✅ DSP 修音启用高质量选项（`--formant`、`--pitch-hq`）
+- ✅ 训练性能优化：TF32 加速 + torch.compile
+- ✅ 端口更新为 8050
+
+### v0.2 (2026-05-25)
+- ✅ 节奏修正模块（节拍网格 + 参考音频对齐）
+- ✅ WORLD vocoder 生成训练数据
+- ✅ Pitch smoothing + 音量归一化后处理
+- ✅ 完整 Web UI
+
+### v0.1 (2026-05-20)
+- ✅ 基础 DSP 修音（音阶模式 + 参考音频模式）
+- ✅ AI 神经网络修音（HiFi-GAN）
+- ✅ FastAPI 后端服务
