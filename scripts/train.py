@@ -118,19 +118,26 @@ class PairedVocalDataset(Dataset):
     def __getitem__(self, idx):
         import soundfile as sf
 
-        pair = self.pairs[idx]
-        clean_path = self.pairs_dir / pair["clean"]
-        hubert_path = self.pairs_dir / pair["hubert"]
+        # Retry with a different index on corrupted files
+        for _ in range(10):
+            pair = self.pairs[idx]
+            clean_path = self.pairs_dir / pair["clean"]
+            hubert_path = self.pairs_dir / pair["hubert"]
+            f0_path = self.pairs_dir / pair["f0"]
 
-        # Load clean audio (target waveform for mel loss)
-        y_clean, _ = sf.read(str(clean_path))
+            try:
+                # Load clean audio (target waveform for mel loss)
+                y_clean, _ = sf.read(str(clean_path))
 
-        # Load cached HuBERT features (T_hubert, 768)
-        hubert_full = np.load(str(hubert_path))
+                # Load cached HuBERT features (T_hubert, 768)
+                hubert_full = np.load(str(hubert_path))
 
-        # Load precomputed WORLD F0 (Hz, WORLD frame rate ~200Hz)
-        f0_path = self.pairs_dir / pair["f0"]
-        f0_full = np.load(str(f0_path))
+                # Load precomputed WORLD F0 (Hz, WORLD frame rate ~200Hz)
+                f0_full = np.load(str(f0_path))
+                break
+            except (ValueError, OSError, EOFError) as e:
+                idx = random.randint(0, len(self.pairs) - 1)
+                continue
 
         # Random segment
         min_len = len(y_clean)
