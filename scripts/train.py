@@ -236,8 +236,14 @@ def train(args):
         print(f"Resumed from epoch {start_epoch}")
 
     print("Compiling models (first step will be slow)...")
-    generator = torch.compile(generator, mode="max-autotune")
-    discriminator = torch.compile(discriminator, mode="max-autotune")
+    generator = torch.compile(
+        generator, mode="max-autotune",
+        options={"triton.cudagraphs": False},
+    )
+    discriminator = torch.compile(
+        discriminator, mode="max-autotune",
+        options={"triton.cudagraphs": False},
+    )
 
     # Optimizers
     opt_g = torch.optim.AdamW(
