@@ -58,17 +58,28 @@ def _apply_pitch_shift(
 # ---------------------------------------------------------------------------
 
 _HUBERT_CACHE: dict = {}
+_HUBERT_LOCK = None
+
+
+def _get_hubert_lock():
+    global _HUBERT_LOCK
+    if _HUBERT_LOCK is None:
+        import threading
+        _HUBERT_LOCK = threading.Lock()
+    return _HUBERT_LOCK
 
 
 def _get_hubert_model(device="cpu"):
-    """Load HuBERT model lazily (cached after first call)."""
+    """Load HuBERT model lazily (cached after first call, thread-safe)."""
     key = f"hubert::{device}"
-    if key not in _HUBERT_CACHE:
-        _HUBERT_CACHE["extractor"] = Wav2Vec2FeatureExtractor.from_pretrained(
-            "facebook/hubert-base-ls960")
-        _HUBERT_CACHE[key] = HubertModel.from_pretrained(
-            "facebook/hubert-base-ls960").to(device).eval()
-    return _HUBERT_CACHE["extractor"], _HUBERT_CACHE[key]
+    lock = _get_hubert_lock()
+    with lock:
+        if key not in _HUBERT_CACHE:
+            _HUBERT_CACHE["extractor"] = Wav2Vec2FeatureExtractor.from_pretrained(
+                "facebook/hubert-base-ls960")
+            _HUBERT_CACHE[key] = HubertModel.from_pretrained(
+                "facebook/hubert-base-ls960").to(device).eval()
+        return _HUBERT_CACHE["extractor"], _HUBERT_CACHE[key]
 
 
 def _extract_hubert_features(y: np.ndarray, sr: int, device="cpu") -> np.ndarray:
