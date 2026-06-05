@@ -22,6 +22,8 @@ from pathlib import Path
 import numpy as np
 import pyworld as pw
 import soundfile as sf
+import torch
+from transformers import HubertModel, Wav2Vec2FeatureExtractor
 
 
 def _apply_pitch_shift(
@@ -62,7 +64,6 @@ def _get_hubert_model(device="cpu"):
     """Load HuBERT model lazily (cached after first call)."""
     key = f"hubert::{device}"
     if key not in _HUBERT_CACHE:
-        from transformers import HubertModel, Wav2Vec2FeatureExtractor
         _HUBERT_CACHE["extractor"] = Wav2Vec2FeatureExtractor.from_pretrained(
             "facebook/hubert-base-ls960")
         _HUBERT_CACHE[key] = HubertModel.from_pretrained(
