@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import pyworld as pw
 import soundfile as sf
+import threading
 import torch
 from transformers import HubertModel, Wav2Vec2FeatureExtractor
 
@@ -58,28 +59,20 @@ def _apply_pitch_shift(
 # ---------------------------------------------------------------------------
 
 _HUBERT_CACHE: dict = {}
-_HUBERT_LOCK = None
-
-
-def _get_hubert_lock():
-    global _HUBERT_LOCK
-    if _HUBERT_LOCK is None:
-        import threading
-        _HUBERT_LOCK = threading.Lock()
-    return _HUBERT_LOCK
+_HUBERT_LOCK = threading.Lock()
 
 
 def _get_hubert_model(device="cpu"):
     """Load HuBERT model lazily (cached after first call, thread-safe)."""
     key = f"hubert::{device}"
-    lock = _get_hubert_lock()
-    with lock:
-        if key not in _HUBERT_CACHE:
-            _HUBERT_CACHE["extractor"] = Wav2Vec2FeatureExtractor.from_pretrained(
-                "facebook/hubert-base-ls960")
-            _HUBERT_CACHE[key] = HubertModel.from_pretrained(
-                "facebook/hubert-base-ls960").to(device).eval()
-        return _HUBERT_CACHE["extractor"], _HUBERT_CACHE[key]
+    if key not in _HUBERT_CACHE:
+        with _HUBERT_LOCK:
+            if key not in _HUBERT_CACHE:  # double-check
+                _HUBERT_CACHE["extractor"] = Wav2Vec2FeatureExtractor.from_pretrained(
+                    "facebook/hubert-base-ls960")
+                _HUBERT_CACHE[key] = HubertModel.from_pretrained(
+                    "facebook/hubert-base-ls960").to(device).eval()
+    return _HUBERT_CACHE["extractor"], _HUBERT_CACHE[key]
 
 
 def _extract_hubert_features(y: np.ndarray, sr: int, device="cpu") -> np.ndarray:
