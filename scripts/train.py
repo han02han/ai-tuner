@@ -313,12 +313,15 @@ def train(args):
             opt_d.zero_grad()
 
             with torch.no_grad():
+                torch.compiler.cudagraph_mark_step_begin()
                 with torch.cuda.amp.autocast():
                     y_gen = generator(hubert_feat, target_f0)
                 y_gen = y_gen[..., :y_clean.shape[-1]]
 
+            torch.compiler.cudagraph_mark_step_begin()
             mpd_real, msd_real = discriminator(y_clean.unsqueeze(1))
-            mpd_fake, msd_fake = discriminator(y_gen.detach().float())
+            torch.compiler.cudagraph_mark_step_begin()
+            mpd_fake, msd_fake = discriminator(y_gen.detach().float().clone())
 
             loss_d = discriminator_loss(
                 [r[0] for r in mpd_real] + [r[0] for r in msd_real],
@@ -339,11 +342,14 @@ def train(args):
             # ----------------------------------------------------------------
             opt_g.zero_grad()
 
+            torch.compiler.cudagraph_mark_step_begin()
             with torch.cuda.amp.autocast():
                 y_gen = generator(hubert_feat, target_f0)
-            y_gen = y_gen[..., :y_clean.shape[-1]]
+            y_gen = y_gen[..., :y_clean.shape[-1]].clone()
 
+            torch.compiler.cudagraph_mark_step_begin()
             mpd_fake, msd_fake = discriminator(y_gen.float())
+            torch.compiler.cudagraph_mark_step_begin()
             mpd_real, msd_real = discriminator(y_clean.unsqueeze(1))
 
             # Mel-spectrogram loss
