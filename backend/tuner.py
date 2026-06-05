@@ -237,6 +237,44 @@ def _normalize_loudness(y: np.ndarray, sr: int, target_db: float = -18.0) -> np.
     return y * gain_linear
 
 
+def _apply_reverb(y: np.ndarray, sr: int, wet_dry: float = 0.06) -> np.ndarray:
+    """Light room reverb via convolution with a synthetic impulse response.
+
+    Adds a barely perceptible ambience that helps mask vocoder artifacts
+    (phase regularity, missing room reflections) which AI detection models
+    use as telltales. The IR is a short decaying burst of filtered noise
+    simulating a small room's early reflections (~50 ms).
+
+    Wet/dry is kept very low (6%) — enough to break the "too clean" pattern
+    without audibly altering the vocal. Can be run on CPU in <100ms for
+    typical song-length audio.
+
+    Args:
+        y: audio waveform
+        sr: sample rate
+        wet_dry: wet/dry mix ratio (0.0 = dry, 1.0 = all wet)
+
+    Returns:
+        audio with subtle room ambience
+    """
+    from scipy.signal import convolve, butter, sosfilt
+
+    # Synthetic small-room IR: 50ms of filtered noise with exponential decay
+    ir_len = int(sr * 0.05)
+    t = np.arange(ir_len) / sr
+    decay = np.exp(-t * 40.0)
+
+    # Bandpass noise 400Hz-4kHz — simulate wall reflections
+    noise = np.random.default_rng(seed=42).normal(0, 1, ir_len)
+    sos = butter(4, [400, 4000], btype="bandpass", fs=sr, output="sos")
+    ir = sosfilt(sos, noise) * decay
+    ir /= np.max(np.abs(ir)) + 1e-10
+
+    # Convolve and mix
+    wet = convolve(y, ir, mode="same")
+    return (1.0 - wet_dry) * y + wet_dry * wet
+
+
 @dataclass
 class TuneResult:
     audio: np.ndarray
@@ -329,6 +367,7 @@ def tune_to_scale(
 
     # Loudness normalization
     y_corrected = _normalize_loudness(y_corrected, sr)
+    y_corrected = _apply_reverb(y_corrected, sr)
 
     frames_corrected = int((np.abs(pitch_shifts_cents) > 5.0).sum())
 
@@ -416,6 +455,7 @@ def tune_to_reference(
 
     # Loudness normalization
     y_corrected = _normalize_loudness(y_corrected, sr)
+    y_corrected = _apply_reverb(y_corrected, sr)
 
     frames_corrected = int((np.abs(pitch_shifts_cents) > 5.0).sum())
 
@@ -609,6 +649,7 @@ def tune_neural(
 
     # Loudness normalization
     y_corrected = _normalize_loudness(y_corrected, sr)
+    y_corrected = _apply_reverb(y_corrected, sr)
 
     frames_corrected = int((np.abs(pitch_shifts_cents) > 5.0).sum())
 
