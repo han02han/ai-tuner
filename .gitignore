@@ -41,6 +41,9 @@ data/out_of_tune/*
 .DS_Store
 Thumbs.db
 
+# AI assistants
+.reasonix/
+
 # Environment
 .env
 .env.local

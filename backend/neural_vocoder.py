@@ -68,7 +68,14 @@ def _make_pitch_feature(pitch_hz: torch.Tensor, n_frames: int) -> torch.Tensor:
 
 
 class InferenceGenerator(nn.Module):
-    """HiFi-GAN generator for inference only (no weight norm at export time)."""
+    """HiFi-GAN generator for inference only.
+
+    Architecture is identical to the training HiFiGANGenerator (hifi_gan.py)
+    but WITHOUT weight_norm — the training script calls remove_weight_norm()
+    before export, so this model loads the exported weights directly.
+
+    See hifi_gan.py for the training-time twin; keep the two in sync.
+    """
 
     def __init__(
         self,
@@ -86,43 +93,85 @@ class InferenceGenerator(nn.Module):
         self.hubert_dim = hubert_dim
         self.upsample_rates = upsample_rates
 
+        # --- Input projection ---
         if hubert_dim > 0:
             self.hubert_proj = nn.Conv1d(hubert_dim, h_channels // 2, kernel_size=1)
             self.input_channels = h_channels // 2 + pitch_bins
         else:
             self.input_channels = mel_bins + pitch_bins
 
+        # --- Pre-convolution (no weight_norm — matches exported weights) ---
         self.conv_pre = nn.Conv1d(
-            self.input_channels, h_channels, 7, stride=1, padding=3)
+            self.input_channels, h_channels, kernel_size=7,
+            stride=1, padding=3,
+        )
+
+        # --- Upsampling blocks (same topology as HiFiGANGenerator) ---
+        self.upsamples = nn.ModuleList()
+        self.mrfs = nn.ModuleList()
+
+        in_ch = h_channels
+        for i, (rate, kernel) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
+            out_ch = upsample_initial_channel // (2 ** (i + 1))
+            self.upsamples.append(
+                nn.ConvTranspose1d(
+                    in_ch, out_ch, kernel,
+                    stride=rate,
+                    padding=(kernel - rate) // 2,
+                )
+            )
+            self.mrfs.append(_MRF(out_ch))
+            in_ch = out_ch
+
+        # --- Post-convolution: hidden → 1 channel waveform ---
+        self.conv_post = nn.Conv1d(in_ch, 1, kernel_size=7, stride=1, padding=3)
 
     def forward(self, input_feat: torch.Tensor, pitch: torch.Tensor | None = None) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            input_feat: (B, hubert_dim, T) HuBERT features, or
+                        (B, mel_bins, T)  mel spectrogram (legacy mode)
+            pitch:      (B, T_pitch) pitch contour in Hz, or None
+
+        Returns:
+            wav: (B, 1, T_audio) generated waveform
+        """
         n_frames = input_feat.shape[2]
 
+        # --- Build input: content features + pitch conditioning ---
         if self.hubert_dim > 0:
             x = F.leaky_relu(self.hubert_proj(input_feat), 0.1)
             if pitch is not None:
                 pitch_feat = _make_pitch_feature(pitch, n_frames)
                 x = torch.cat([x, pitch_feat], dim=1)
             else:
-                x = torch.cat([x, torch.zeros(x.shape[0], 1, n_frames, device=x.device)], dim=1)
+                x = torch.cat([
+                    x,
+                    torch.zeros(x.shape[0], 1, n_frames, device=x.device),
+                ], dim=1)
         else:
             if pitch is not None:
                 pitch_feat = _make_pitch_feature(pitch, n_frames)
                 x = torch.cat([input_feat, pitch_feat], dim=1)
             else:
-                x = torch.cat([input_feat, torch.zeros(input_feat.shape[0], 1, n_frames, device=input_feat.device)], dim=1)
+                x = torch.cat([
+                    input_feat,
+                    torch.zeros(input_feat.shape[0], 1, n_frames, device=input_feat.device),
+                ], dim=1)
 
+        # --- Generator forward ---
         x = self.conv_pre(x)
+
         for upsample, mrf in zip(self.upsamples, self.mrfs):
             x = F.leaky_relu(x, 0.1)
             x = upsample(x)
             x = mrf(x)
+
         x = F.leaky_relu(x, 0.1)
         x = self.conv_post(x)
         return torch.tanh(x)
 
-
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # HuBERT feature extraction for inference
