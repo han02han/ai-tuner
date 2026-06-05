@@ -200,7 +200,7 @@ def _process_file(args):
             if use_hubert:
                 hubert_path = pairs_dir / f"{global_id:05d}_hubert.npy"
                 try:
-                    hubert_feats = _extract_hubert_features(y_shifted, sr)
+                    hubert_feats = _extract_hubert_features(y_shifted, sr, device="cuda" if torch.cuda.is_available() else "cpu")
                     np.save(str(hubert_path), hubert_feats.astype(np.float32))
                     hubert_path_str = str(hubert_path.name)
                 except Exception as e:
