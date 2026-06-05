@@ -316,6 +316,8 @@ def train(args):
                 torch.compiler.cudagraph_mark_step_begin()
                 with torch.cuda.amp.autocast():
                     y_gen = generator(hubert_feat, target_f0)
+                if y_gen.shape[-1] < y_clean.shape[-1]:
+                    y_gen = F.pad(y_gen, (0, y_clean.shape[-1] - y_gen.shape[-1]))
                 y_gen = y_gen[..., :y_clean.shape[-1]]
 
             torch.compiler.cudagraph_mark_step_begin()
@@ -345,6 +347,8 @@ def train(args):
             torch.compiler.cudagraph_mark_step_begin()
             with torch.cuda.amp.autocast():
                 y_gen = generator(hubert_feat, target_f0)
+            if y_gen.shape[-1] < y_clean.shape[-1]:
+                y_gen = F.pad(y_gen, (0, y_clean.shape[-1] - y_gen.shape[-1]))
             y_gen = y_gen[..., :y_clean.shape[-1]].clone()
 
             torch.compiler.cudagraph_mark_step_begin()
