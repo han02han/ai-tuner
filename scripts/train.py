@@ -94,11 +94,13 @@ class PairedVocalDataset(Dataset):
     """
 
     def __init__(self, data_dir: str, segment_ms: int = 800,
-                 sample_rate: int = 22050, hubert_dim: int = 768):
+                 sample_rate: int = 22050, hubert_dim: int = 768,
+                 target_rms: float = 0.15):
         self.data_dir = Path(data_dir)
         self.segment_samples = int(segment_ms / 1000.0 * sample_rate)
         self.sample_rate = sample_rate
         self.hubert_dim = hubert_dim
+        self.target_rms = target_rms
 
         with open(self.data_dir / "metadata.json") as f:
             self.metadata = json.load(f)
@@ -138,6 +140,11 @@ class PairedVocalDataset(Dataset):
             except (ValueError, OSError, EOFError) as e:
                 idx = random.randint(0, len(self.pairs) - 1)
                 continue
+
+        # RMS normalize to consistent level
+        rms_val = np.sqrt(np.mean(y_clean ** 2) + 1e-8)
+        if rms_val > 1e-6:
+            y_clean = y_clean * (self.target_rms / rms_val)
 
         # Random segment
         min_len = len(y_clean)
@@ -249,7 +256,7 @@ def train(args):
     generator = torch.compile(generator)
     discriminator = torch.compile(discriminator)
 
-    # Optimizers
+    # Optimizers — D has 19× more params than G, needs lower LR
     opt_g = torch.optim.AdamW(
         generator.parameters(),
         lr=config.learning_rate,
@@ -257,7 +264,7 @@ def train(args):
     )
     opt_d = torch.optim.AdamW(
         discriminator.parameters(),
-        lr=config.learning_rate,
+        lr=config.learning_rate * 0.25,  # 4× lower to prevent D overfitting
         betas=(config.adam_b1, config.adam_b2),
     )
 
@@ -275,7 +282,7 @@ def train(args):
 
     # Training loop
     global_step = 0
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler("cuda") if torch.cuda.is_available() else torch.amp.GradScaler("cpu")
 
     for epoch in range(start_epoch, config.num_epochs):
         generator.train()
@@ -323,16 +330,13 @@ def train(args):
             opt_d.zero_grad()
 
             with torch.no_grad():
-                torch.compiler.cudagraph_mark_step_begin()
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast("cuda"):
                     y_gen = generator(hubert_feat, target_f0)
                 if y_gen.shape[-1] < y_clean.shape[-1]:
                     y_gen = F.pad(y_gen, (0, y_clean.shape[-1] - y_gen.shape[-1]))
                 y_gen = y_gen[..., :y_clean.shape[-1]]
 
-            torch.compiler.cudagraph_mark_step_begin()
             mpd_real, msd_real = discriminator(y_clean.unsqueeze(1))
-            torch.compiler.cudagraph_mark_step_begin()
             mpd_fake, msd_fake = discriminator(y_gen.detach().float().clone())
 
             loss_d = discriminator_loss(
@@ -355,15 +359,13 @@ def train(args):
             opt_g.zero_grad()
 
             torch.compiler.cudagraph_mark_step_begin()
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast("cuda"):
                 y_gen = generator(hubert_feat, target_f0)
             if y_gen.shape[-1] < y_clean.shape[-1]:
                 y_gen = F.pad(y_gen, (0, y_clean.shape[-1] - y_gen.shape[-1]))
             y_gen = y_gen[..., :y_clean.shape[-1]].clone()
 
-            torch.compiler.cudagraph_mark_step_begin()
             mpd_fake, msd_fake = discriminator(y_gen.float())
-            torch.compiler.cudagraph_mark_step_begin()
             mpd_real, msd_real = discriminator(y_clean.unsqueeze(1))
 
             # Mel-spectrogram loss
