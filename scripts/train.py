@@ -70,9 +70,9 @@ class TrainConfig:
     grad_clip: float = 5.0
 
     # Loss weights
-    lambda_mel: float = 45.0
+    lambda_mel: float = 100.0
     lambda_fm: float = 2.0
-    lambda_adv: float = 1.0
+    lambda_adv: float = 0.3
 
     # Logging
     log_interval: int = 100
@@ -194,6 +194,9 @@ def train(args):
     config.num_epochs = args.num_epochs
     config.learning_rate = args.lr
     config.device = args.device or config.device
+    config.lambda_mel = args.lambda_mel
+    config.lambda_fm = args.lambda_fm
+    config.lambda_adv = args.lambda_adv
 
     device = torch.device(config.device)
 
@@ -491,6 +494,12 @@ if __name__ == "__main__":
                         help="Device: cuda / cpu")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader workers")
+    parser.add_argument("--lambda_mel", type=float, default=100.0,
+                        help="Mel loss weight")
+    parser.add_argument("--lambda_fm", type=float, default=2.0,
+                        help="Feature matching loss weight")
+    parser.add_argument("--lambda_adv", type=float, default=0.3,
+                        help="Adversarial loss weight")
 
     args = parser.parse_args()
     train(args)
