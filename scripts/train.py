@@ -67,6 +67,7 @@ class TrainConfig:
     adam_b1: float = 0.8
     adam_b2: float = 0.99
     num_epochs: int = 100
+    warmup_epochs: int = 5  # mel-loss only, no discriminator
     grad_clip: float = 5.0
 
     # Loss weights
@@ -204,6 +205,7 @@ def train(args):
     config.lambda_mel = args.lambda_mel
     config.lambda_fm = args.lambda_fm
     config.lambda_adv = args.lambda_adv
+    config.warmup_epochs = args.warmup_epochs
 
     device = torch.device(config.device)
 
@@ -284,11 +286,19 @@ def train(args):
     global_step = 0
     scaler = torch.amp.GradScaler("cuda") if torch.cuda.is_available() else torch.amp.GradScaler("cpu")
 
+    warmup = (start_epoch < config.warmup_epochs)
+
     for epoch in range(start_epoch, config.num_epochs):
         generator.train()
         discriminator.train()
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config.num_epochs}")
+        in_warmup = (epoch < config.warmup_epochs)
+        if in_warmup != warmup:
+            warmup = in_warmup
+            if not warmup:
+                print("  --- Warmup complete, enabling GAN loss ---")
+
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config.num_epochs}" + (" [warmup]" if warmup else ""))
         epoch_loss_g = 0.0
         epoch_loss_d = 0.0
 
@@ -325,67 +335,60 @@ def train(args):
                 _t2 = time.perf_counter()
 
             # ----------------------------------------------------------------
-            # Train Discriminator
-            # ----------------------------------------------------------------
-            opt_d.zero_grad()
-
-            with torch.no_grad():
-                with torch.amp.autocast("cuda"):
-                    y_gen = generator(hubert_feat, target_f0)
-                if y_gen.shape[-1] < y_clean.shape[-1]:
-                    y_gen = F.pad(y_gen, (0, y_clean.shape[-1] - y_gen.shape[-1]))
-                y_gen = y_gen[..., :y_clean.shape[-1]]
-
-            mpd_real, msd_real = discriminator(y_clean.unsqueeze(1))
-            mpd_fake, msd_fake = discriminator(y_gen.detach().float().clone())
-
-            loss_d = discriminator_loss(
-                [r[0] for r in mpd_real] + [r[0] for r in msd_real],
-                [f[0] for f in mpd_fake] + [f[0] for f in msd_fake],
-            )
-            scaler.scale(loss_d).backward()
-            scaler.unscale_(opt_d)
-            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), config.grad_clip)
-            scaler.step(opt_d)
-
-            if _profile:
-                torch.cuda.synchronize()
-                _t_dsc = time.perf_counter() - _t2
-                _t3 = time.perf_counter()
-
-            # ----------------------------------------------------------------
-            # Train Generator
+            # Train Generator (always: mel loss; after warmup: +adv +fm)
             # ----------------------------------------------------------------
             opt_g.zero_grad()
 
-            torch.compiler.cudagraph_mark_step_begin()
             with torch.amp.autocast("cuda"):
                 y_gen = generator(hubert_feat, target_f0)
             if y_gen.shape[-1] < y_clean.shape[-1]:
                 y_gen = F.pad(y_gen, (0, y_clean.shape[-1] - y_gen.shape[-1]))
             y_gen = y_gen[..., :y_clean.shape[-1]].clone()
 
-            mpd_fake, msd_fake = discriminator(y_gen.float())
-            mpd_real, msd_real = discriminator(y_clean.unsqueeze(1))
-
             # Mel-spectrogram loss
             loss_mel = mel_loss_fn(y_gen, y_clean.unsqueeze(1))
 
-            # Feature matching loss
-            fm_real = [r[1] for r in mpd_real] + [r[1] for r in msd_real]
-            fm_fake = [f[1] for f in mpd_fake] + [f[1] for f in msd_fake]
-            loss_fm = feature_loss(fm_real, fm_fake)
+            if warmup:
+                # Warmup: generator trained with mel loss only
+                loss_g = config.lambda_mel * loss_mel
+                loss_fm = torch.tensor(0.0)
+                loss_adv = torch.tensor(0.0)
+                loss_d = torch.tensor(0.0)
+            else:
+                # Full GAN: also train discriminator
+                opt_d.zero_grad()
 
-            # Adversarial loss
-            loss_adv = generator_loss(
-                [f[0] for f in mpd_fake] + [f[0] for f in msd_fake]
-            )
+                with torch.no_grad():
+                    mpd_fake_d, msd_fake_d = discriminator(y_gen.detach().float())
+                mpd_real_d, msd_real_d = discriminator(y_clean.unsqueeze(1))
 
-            loss_g = (
-                config.lambda_mel * loss_mel +
-                config.lambda_fm * loss_fm +
-                config.lambda_adv * loss_adv
-            )
+                loss_d = discriminator_loss(
+                    [r[0] for r in mpd_real_d] + [r[0] for r in msd_real_d],
+                    [f[0] for f in mpd_fake_d] + [f[0] for f in msd_fake_d],
+                )
+                scaler.scale(loss_d).backward()
+                scaler.unscale_(opt_d)
+                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), config.grad_clip)
+                scaler.step(opt_d)
+
+                # Generator GAN terms
+                mpd_fake, msd_fake = discriminator(y_gen.float())
+                mpd_real, msd_real = discriminator(y_clean.unsqueeze(1))
+
+                fm_real = [r[1] for r in mpd_real] + [r[1] for r in msd_real]
+                fm_fake = [f[1] for f in mpd_fake] + [f[1] for f in msd_fake]
+                loss_fm = feature_loss(fm_real, fm_fake)
+
+                loss_adv = generator_loss(
+                    [f[0] for f in mpd_fake] + [f[0] for f in msd_fake]
+                )
+
+                loss_g = (
+                    config.lambda_mel * loss_mel +
+                    config.lambda_fm * loss_fm +
+                    config.lambda_adv * loss_adv
+                )
+
             scaler.scale(loss_g).backward()
             scaler.unscale_(opt_g)
             torch.nn.utils.clip_grad_norm_(generator.parameters(), config.grad_clip)
@@ -394,7 +397,7 @@ def train(args):
 
             if _profile:
                 torch.cuda.synchronize()
-                _t_gen = time.perf_counter() - _t3
+                _t_gen = time.perf_counter() - _t2
 
             # Logging
             epoch_loss_g += loss_g.item()
@@ -411,16 +414,21 @@ def train(args):
             if _profile:
                 writer.add_scalar("profile/data_ms", _t_data * 1000, global_step)
                 writer.add_scalar("profile/mel_ms", _t_mel * 1000, global_step)
-                writer.add_scalar("profile/disc_ms", _t_dsc * 1000, global_step)
                 writer.add_scalar("profile/gen_ms", _t_gen * 1000, global_step)
-                pbar.set_postfix(
-                    g=f"{loss_g.item():.2f}",
-                    d=f"{loss_d.item():.2f}",
-                    io=f"{_t_data*1000:.0f}ms",
-                    hf=f"{_t_mel*1000:.0f}ms",
-                    dc=f"{_t_dsc*1000:.0f}ms",
-                    gn=f"{_t_gen*1000:.0f}ms",
-                )
+                if warmup:
+                    pbar.set_postfix(
+                        g=f"{loss_g.item():.2f}",
+                        mel=f"{loss_mel.item():.1f}",
+                        io=f"{_t_data*1000:.0f}ms",
+                    )
+                else:
+                    pbar.set_postfix(
+                        g=f"{loss_g.item():.2f}",
+                        d=f"{loss_d.item():.2f}",
+                        io=f"{_t_data*1000:.0f}ms",
+                        hf=f"{_t_mel*1000:.0f}ms",
+                        gn=f"{_t_gen*1000:.0f}ms",
+                    )
             else:
                 pbar.set_postfix(
                     g=f"{loss_g.item():.2f}",
@@ -430,7 +438,8 @@ def train(args):
             global_step += 1
 
         scheduler_g.step()
-        scheduler_d.step()
+        if not warmup:
+            scheduler_d.step()
 
         # Epoch summary
         avg_g = epoch_loss_g / len(dataloader)
@@ -492,6 +501,8 @@ if __name__ == "__main__":
                         help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=2e-4,
                         help="Learning rate")
+    parser.add_argument("--warmup_epochs", type=int, default=5,
+                        help="Mel-only warmup epochs (no discriminator)")
     parser.add_argument("--device", default=None,
                         help="Device: cuda / cpu")
     parser.add_argument("--num_workers", type=int, default=4,
