@@ -1,6 +1,7 @@
 """FastAPI backend for AI Tuner - pitch correction web service."""
 
 import os
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 import sys
 import uuid
 from pathlib import Path
