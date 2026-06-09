@@ -53,17 +53,20 @@ class _MRF(nn.Module):
 
 
 def _make_pitch_feature(pitch_hz: torch.Tensor, n_frames: int) -> torch.Tensor:
-    """Convert Hz pitch to [-1, 1] feature map."""
+    """Convert Hz pitch to a feature matching training distribution.
+
+    Training feeds raw WORLD F0 (65-1047 Hz range) directly.
+    Scale Hz to keep values in a reasonable range for the model.
+    """
     B, T = pitch_hz.shape
     if T != n_frames:
         pitch_hz = F.interpolate(
             pitch_hz.unsqueeze(1), size=n_frames,
             mode="linear", align_corners=False).squeeze(1)
-    pitch_feat = torch.zeros(B, 1, n_frames, device=pitch_hz.device)
-    voiced = pitch_hz > 20.0
-    if voiced.any():
-        log_pitch = torch.log2(torch.clamp(pitch_hz, min=20.0) / 440.0)
-        pitch_feat[:, 0, :] = torch.tanh(log_pitch / 4.0)
+    # Raw Hz, scaled to ~[0, 3] range to match training F0 distribution
+    pitch_feat = pitch_hz.unsqueeze(1) / 400.0
+    # Unvoiced → 0
+    pitch_feat[pitch_hz <= 20.0] = 0.0
     return pitch_feat
 
 
@@ -95,8 +98,9 @@ class InferenceGenerator(nn.Module):
 
         # --- Input projection ---
         if hubert_dim > 0:
-            self.hubert_proj = nn.Conv1d(hubert_dim, h_channels // 2, kernel_size=1)
-            self.input_channels = h_channels // 2 + pitch_bins
+            # HuBERT → mel_bins to match training hifi_gan.py architecture
+            self.hubert_proj = nn.Conv1d(hubert_dim, mel_bins, kernel_size=1)
+            self.input_channels = mel_bins + pitch_bins
         else:
             self.input_channels = mel_bins + pitch_bins
 
