@@ -632,11 +632,15 @@ def tune_neural(
         # Generate corrected waveform
         y_corrected_tensor = model(hubert, target_pitch_tensor)
 
-    y_corrected = y_corrected_tensor.squeeze().cpu().numpy()
-
+    # Interpolate to match expected audio length (same as training)
     expected_len = len(y)
-    if len(y_corrected) > expected_len:
-        y_corrected = y_corrected[:expected_len]
+    if y_corrected_tensor.shape[-1] != expected_len:
+        y_corrected_tensor = torch.nn.functional.interpolate(
+            y_corrected_tensor.unsqueeze(1), size=expected_len,
+            mode="linear", align_corners=False,
+        ).squeeze(1)
+
+    y_corrected = y_corrected_tensor.squeeze().cpu().numpy()
 
     # Loudness normalization
     y_corrected = _normalize_loudness(y_corrected, sr)

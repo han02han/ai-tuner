@@ -341,9 +341,14 @@ def train(args):
 
             with torch.amp.autocast("cuda"):
                 y_gen = generator(hubert_feat, target_f0)
-            if y_gen.shape[-1] < y_clean.shape[-1]:
-                y_gen = F.pad(y_gen, (0, y_clean.shape[-1] - y_gen.shape[-1]))
-            y_gen = y_gen[..., :y_clean.shape[-1]].clone()
+            # Interpolate generator output to match clean audio length
+            # (generator upsampling 256x * 50Hz HuBERT ≠ 22050Hz, ~1.7x short)
+            if y_gen.shape[-1] != y_clean.shape[-1]:
+                y_gen = F.interpolate(
+                    y_gen.unsqueeze(1), size=y_clean.shape[-1],
+                    mode="linear", align_corners=False,
+                ).squeeze(1)
+            y_gen = y_gen.clone()
 
             # Mel-spectrogram loss
             loss_mel = mel_loss_fn(y_gen, y_clean.unsqueeze(1))
