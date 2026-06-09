@@ -506,23 +506,15 @@ def _load_model(model_path: str | None = None) -> tuple:
         return _MODEL, device
 
     import torch
-    from neural_vocoder import InferenceGenerator, load_model
+    from neural_vocoder import load_model
 
     if os.path.exists(model_path):
         _MODEL = load_model(model_path, device)
     else:
-        # Try loading from latest checkpoint
-        ckpt_path = project_root / "checkpoints" / "latest.pt"
-        if ckpt_path.exists():
-            ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-            _MODEL = InferenceGenerator().to(device)
-            _MODEL.load_state_dict(ckpt["generator"])
-            _MODEL.eval()
-        else:
-            raise FileNotFoundError(
-                f"No model found at {model_path} or {ckpt_path}. "
-                "Train the model first with: python scripts/train.py"
-            )
+        raise FileNotFoundError(
+            f"No model found at {model_path}. "
+            "Train the model first with: python scripts/train.py"
+        )
 
     _MODEL_PATH = model_path
     _DEVICE = device
