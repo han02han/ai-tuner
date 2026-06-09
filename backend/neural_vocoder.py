@@ -98,9 +98,9 @@ class InferenceGenerator(nn.Module):
 
         # --- Input projection ---
         if hubert_dim > 0:
-            # HuBERT → mel_bins to match training hifi_gan.py architecture
-            self.hubert_proj = nn.Conv1d(hubert_dim, mel_bins, kernel_size=1)
-            self.input_channels = mel_bins + pitch_bins
+            # HuBERT → h_channels//2 to match training hifi_gan.py architecture
+            self.hubert_proj = nn.Conv1d(hubert_dim, h_channels // 2, kernel_size=1)
+            self.input_channels = h_channels // 2 + pitch_bins
         else:
             self.input_channels = mel_bins + pitch_bins
 
