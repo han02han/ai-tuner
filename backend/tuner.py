@@ -634,10 +634,19 @@ def tune_neural(
 
     y_corrected = y_corrected_tensor.squeeze().cpu().numpy()
 
-    # Trim to expected length
+    # Generator outputs at 12.8 kHz (50Hz HuBERT * 256 upsampling),
+    # but target is 22.05 kHz. Resample to fix duration and pitch.
+    import librosa
+    gen_sr = int(50 * 256)  # 12800 Hz
+    y_corrected = librosa.resample(y_corrected.astype(np.float64),
+                                    orig_sr=gen_sr, target_sr=sr)
+
+    # Trim or pad to match exact input length
     expected_len = len(y)
     if len(y_corrected) > expected_len:
         y_corrected = y_corrected[:expected_len]
+    elif len(y_corrected) < expected_len:
+        y_corrected = np.pad(y_corrected, (0, expected_len - len(y_corrected)))
 
     # Loudness normalization
     y_corrected = _normalize_loudness(y_corrected, sr)
